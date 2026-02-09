@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import numpy as np
 import os
@@ -7,11 +8,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (Defaults) ---
 DATA_FILE = "full_data_cache.parquet"
 MODEL_BUY = "model_rf_buy_old.onnx"
 MODEL_SELL = "model_rf_sell_old.onnx"
-OUT_DIR = "audit_results_old_model"
 
 # Validation Periods (User Requested Split)
 TRAIN_START = "2025-01-01"
@@ -19,22 +19,18 @@ TRAIN_END = "2025-06-30"
 VAL_END = "2025-11-30"
 OOS_START = "2025-12-01"
 
-# Parameters for Sensitivity
-DEFAULT_HOLD = 240
-HOLD_SENSITIVITY = [170, 240, 310]
-COST_PIPS_SENSITIVITY = [1.0, 2.0]
-
 class SoundnessAudit:
-    def __init__(self, data_path, model_buy_path, model_sell_path):
+    def __init__(self, data_path, model_buy_path, model_sell_path, out_dir="audit_results"):
         self.data_path = data_path
         self.model_buy_path = model_buy_path
         self.model_sell_path = model_sell_path
+        self.out_dir = out_dir
         self.ohlc = None
+        self.bid_ohlc = None
         self.feat = None
-        self.signals = None
         
-        if not os.path.exists(OUT_DIR):
-            os.makedirs(OUT_DIR)
+        if not os.path.exists(self.out_dir):
+            os.makedirs(self.out_dir)
 
     def load_and_preprocess(self):
         print(f"Loading data from {self.data_path}...")
@@ -62,13 +58,15 @@ class SoundnessAudit:
         c = self.ohlc['close']
         h = self.ohlc['high']
         l = self.ohlc['low']
+        o = self.ohlc['open']
         
         self.ohlc['SMA120'] = ta.trend.sma_indicator(c, window=120)
         self.ohlc['RSI'] = ta.momentum.rsi(c, window=14)
         
         sma20 = ta.trend.sma_indicator(c, window=20)
         sma60 = ta.trend.sma_indicator(c, window=60)
-        atr_1m = ta.volatility.average_true_range(h, l, c, window=14)
+        self.ohlc['ATR_1m'] = ta.volatility.average_true_range(h, l, c, window=14)
+        self.ohlc['Body_Size'] = (c - o).abs()
         
         # ATR 1H for SL (as in local_ultimate_audit)
         ohlc_1h = c.resample('1h').ohlc().dropna()
@@ -80,7 +78,7 @@ class SoundnessAudit:
         self.feat['RSI'] = self.ohlc['RSI']
         self.feat['dist_sma'] = (c - sma20) / sma20
         self.feat['mom_smas'] = (sma20 - sma60) / sma60
-        self.feat['ATR'] = atr_1m
+        self.feat['ATR'] = self.ohlc['ATR_1m']
         
         # Regime Indicators
         self.ohlc['SMA120_Slope'] = self.ohlc['SMA120'].diff(5) # 5-min slope
@@ -115,7 +113,9 @@ class SoundnessAudit:
         signals = (prob_s >= rolling_thr) & atr_filter
         return signals[signals].index
 
-    def backtest(self, entry_timestamps, side, hold_m=240, cost_pips=1.0, sl_atr_mult=3.0, early_exit=False):
+    def backtest(self, entry_timestamps, side, exit_mode='baseline_hold', 
+                 hold_m=240, cost_pips=1.0, sl_atr_mult=3.0, 
+                 mae_cut_pips=35, decay_window=30, decay_ratio=0.5):
         results = []
         
         for t in entry_timestamps:
@@ -129,10 +129,14 @@ class SoundnessAudit:
             entry_price = self.ohlc.iloc[entry_idx]['open'] if side == 'BUY' else self.bid_ohlc.iloc[entry_idx]['open']
             
             # SL calculation (ATR-based)
-            atr_val = self.ohlc.iloc[entry_idx-1]['ATR_1H']
-            sl_dist = atr_val * sl_atr_mult
+            atr_h1_val = self.ohlc.iloc[entry_idx-1]['ATR_1H']
+            sl_dist = atr_h1_val * sl_atr_mult
             sl_price = entry_price - sl_dist if side == 'BUY' else entry_price + sl_dist
             
+            # Energy Decay Initial Stats (C1/C2)
+            entry_atr_1m = self.ohlc.iloc[entry_idx]['ATR_1m']
+            entry_body_avg = self.ohlc.iloc[entry_idx-5:entry_idx+1]['Body_Size'].mean() # 5-min average at entry
+
             # Simulation Window
             end_idx = min(entry_idx + hold_m, len(self.ohlc) - 1)
             window_ohlc = self.ohlc.iloc[entry_idx : end_idx + 1]
@@ -141,33 +145,62 @@ class SoundnessAudit:
             exit_price = None
             exit_reason = "HOLD"
             mae = 0
+            mfe = 0
             
             for i in range(len(window_ohlc)):
                 curr_ohlc = window_ohlc.iloc[i]
                 curr_bid = window_bid.iloc[i]
                 
-                # Check SL (Conservative: SL hit prioritized within bar)
+                # Update MAE/MFE
                 if side == 'BUY':
                     low_p = curr_bid['low']
+                    high_p = curr_ohlc['high']
+                    mae = max(mae, entry_price - low_p)
+                    mfe = max(mfe, high_p - entry_price)
+                    
                     if low_p <= sl_price:
                         exit_price = sl_price
                         exit_reason = "SL"
                         break
-                    mae = max(mae, entry_price - low_p)
                 else:
                     high_p = curr_ohlc['high']
+                    low_p = curr_bid['low']
+                    mae = max(mae, high_p - entry_price)
+                    mfe = max(mfe, entry_price - low_p)
+                    
                     if high_p >= sl_price:
                         exit_price = sl_price
                         exit_reason = "SL"
                         break
-                    mae = max(mae, high_p - entry_price)
+
+                # --- Exit Mode Logic ---
                 
-                # Test G: Early Exit (30 min check)
-                if early_exit and i == 30:
-                    current_profit_pips = (curr_bid['close'] - entry_price) * 100 if side == 'BUY' else (entry_price - curr_ohlc['close']) * 100
-                    if current_profit_pips < 2.0:
+                # Exit B: MAE Monitoring Cut (at 30m)
+                if exit_mode == 'mae_cut' and i == 30:
+                    current_mae_pips = mae * 100
+                    if current_mae_pips >= mae_cut_pips:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
-                        exit_reason = "EARLY_EXIT"
+                        exit_reason = "MAE_CUT"
+                        break
+
+                # Exit C: Energy Decay (starting at 20m)
+                if exit_mode == 'energy_decay' and i >= 20:
+                    # Lookback Window
+                    start_look = max(0, i - decay_window)
+                    window_segment = window_ohlc.iloc[start_look : i + 1]
+                    
+                    # C1: Body Decay
+                    current_body_avg = window_segment['Body_Size'].mean()
+                    if current_body_avg < entry_body_avg * decay_ratio:
+                        exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                        exit_reason = "DECAY_BODY"
+                        break
+                        
+                    # C2: Volatility Decay
+                    current_atr_avg = window_segment['ATR_1m'].mean()
+                    if current_atr_avg < entry_atr_1m * decay_ratio:
+                        exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                        exit_reason = "DECAY_VOL"
                         break
             
             if exit_price is None:
@@ -190,134 +223,153 @@ class SoundnessAudit:
                 'exit_p': exit_price,
                 'net_pips': net_pips,
                 'mae': mae * 100,
+                'mfe': mfe * 100,
                 'reason': exit_reason,
                 'sma_trend': sma_trend,
                 'vol_regime': vol_regime,
-                'hour_utc': t.hour
+                'hour_utc': t.hour,
+                'hold_min_actual': i
             })
             
         return pd.DataFrame(results)
 
-    def run_all_tests(self):
+    def calculate_risk_metrics(self, trades_df):
+        if trades_df.empty:
+            return {}
+            
+        metrics = {}
+        for period in ['TRAIN', 'VAL', 'OOS']:
+            p_df = trades_df[trades_df['period'] == period]
+            if p_df.empty: continue
+            
+            pos = p_df[p_df['net_pips'] > 0]['net_pips'].sum()
+            neg = abs(p_df[p_df['net_pips'] < 0]['net_pips'].sum())
+            pf = pos / neg if neg != 0 else np.inf
+            win_rate = (p_df['net_pips'] > 0).mean() * 100
+            
+            # Max DD
+            cum_pips = p_df['net_pips'].cumsum()
+            running_max = cum_pips.cummax()
+            dd = cum_pips - running_max
+            max_dd = dd.min()
+            
+            metrics[period] = {
+                'pf': round(pf, 2),
+                'winrate': round(win_rate, 2),
+                'max_dd_pips': round(max_dd, 2),
+                'mae_p95': round(p_df['mae'].quantile(0.95), 2),
+                'mae_p99': round(p_df['mae'].quantile(0.99), 2)
+            }
+        return metrics
+
+    def run_all_tests(self, exit_mode='baseline_hold', hold_m=240, cost_pips=1.0, mae_cut_pips=35, decay_ratio=0.5):
         # 1. Prediction for both sides
         buy_signals = self.run_inference('BUY')
-        sell_signals = self.run_inference('SELL')
         
-        # Test A/D: Period-wise + Side-wise
-        print("Test A & D: Period/Side Analysis...")
-        all_trades_list = []
-        for side, sigs in [('BUY', buy_signals), ('SELL', sell_signals)]:
-            trades = self.backtest(sigs, side)
-            all_trades_list.append(trades)
+        print(f"--- Running Audit: Mode={exit_mode}, Cost={cost_pips} ---")
+        buy_trades = self.backtest(buy_signals, 'BUY', exit_mode=exit_mode, hold_m=hold_m, cost_pips=cost_pips, mae_cut_pips=mae_cut_pips, decay_ratio=decay_ratio)
         
-        all_trades = pd.concat(all_trades_list)
-        all_trades.to_csv(f"{OUT_DIR}/trades_base.csv", index=False)
-        
+        if buy_trades.empty:
+            print("No trades generated.")
+            return []
+
         # Period Split
-        all_trades['period'] = 'OOS'
-        all_trades.loc[all_trades['timestamp'] <= pd.Timestamp(TRAIN_END), 'period'] = 'TRAIN'
-        all_trades.loc[(all_trades['timestamp'] > pd.Timestamp(TRAIN_END)) & (all_trades['timestamp'] <= pd.Timestamp(VAL_END)), 'period'] = 'VAL'
+        buy_trades['period'] = 'OOS'
+        buy_trades.loc[buy_trades['timestamp'] <= pd.Timestamp(TRAIN_END), 'period'] = 'TRAIN'
+        buy_trades.loc[(buy_trades['timestamp'] > pd.Timestamp(TRAIN_END)) & (buy_trades['timestamp'] <= pd.Timestamp(VAL_END)), 'period'] = 'VAL'
         
-        period_summary = all_trades.groupby(['period', 'side'])['net_pips'].agg(['sum', 'mean', 'count']).round(2)
-        print("\n--- Period Summary (BUY/SELL) ---")
-        print(period_summary)
-        period_summary.to_csv(f"{OUT_DIR}/summary_period.csv")
+        # Save Details
+        buy_trades.to_csv(f"{self.out_dir}/trades.csv", index=False)
         
-        # Test B: HOLD Sensitivity
-        print("Test B: HOLD Sensitivity...")
-        sensitivity_results = []
-        for hold in HOLD_SENSITIVITY:
-            for side, sigs in [('BUY', buy_signals), ('SELL', sell_signals)]:
-                res = self.backtest(sigs, side, hold_m=hold)
-                if not res.empty:
-                    sensitivity_results.append({'hold': hold, 'side': side, 'sum_pips': res['net_pips'].sum(), 'mean_pips': res['net_pips'].mean()})
-        pd.DataFrame(sensitivity_results).to_csv(f"{OUT_DIR}/summary_hold_sensitivity.csv", index=False)
-
-        # Test C: Cost Sensitivity
-        print("Test C: Cost Sensitivity...")
-        cost_results = []
-        for cost in COST_PIPS_SENSITIVITY:
-            for side, sigs in [('BUY', buy_signals), ('SELL', sell_signals)]:
-                res = self.backtest(sigs, side, cost_pips=cost)
-                if not res.empty:
-                    cost_results.append({'cost': cost, 'side': side, 'sum_pips': res['net_pips'].sum()})
-        pd.DataFrame(cost_results).to_csv(f"{OUT_DIR}/summary_cost_sensitivity.csv", index=False)
-
-        # Test E: Regime
-        print("Test E: Regime Analysis...")
-        regime_summary = all_trades.groupby(['sma_trend', 'vol_regime'])['net_pips'].mean().unstack().round(2)
-        regime_summary.to_csv(f"{OUT_DIR}/summary_regime.csv")
-
-        # Test F: MAE
-        print("Test F: MAE Distribution...")
-        mae_stats = all_trades.groupby('side')['mae'].describe(percentiles=[0.5, 0.9, 0.95, 0.99])
-        mae_stats.to_csv(f"{OUT_DIR}/summary_mae.csv")
-
-        # Test G: Early Exit
-        print("Test G: Early Exit Test...")
-        early_res = []
-        for side, sigs in [('BUY', buy_signals)]:
-            base = self.backtest(sigs, side, early_exit=False)
-            early = self.backtest(sigs, side, early_exit=True)
-            early_res.append({'side': side, 'base_pips': base['net_pips'].sum(), 'early_pips': early['net_pips'].sum()})
-        pd.DataFrame(early_res).to_csv(f"{OUT_DIR}/summary_early_exit.csv", index=False)
-
-        self.generate_report(all_trades, sensitivity_results, cost_results, mae_stats)
-
-    def generate_report(self, all_trades, sens, costs, mae):
-        print("Generating Report...")
+        # summary_period.csv (Standard)
+        summary = buy_trades.groupby(['period', 'side'])['net_pips'].agg(['sum', 'mean', 'count']).round(2)
+        summary.to_csv(f"{self.out_dir}/summary_period.csv")
         
-        # Scoring Logic
-        # (Simplified for demonstration, can be refined)
-        score = 0
-        oos_pips = all_trades[(all_trades['period'] == 'OOS') & (all_trades['side'] == 'BUY')]['net_pips'].sum()
-        if oos_pips > 0: score += 2
-        
-        # Check Hold stability
-        buy_sens = [s['sum_pips'] for s in sens if s['side'] == 'BUY']
-        if all(p > 0 for p in buy_sens): score += 2
-        
-        report = f"""# AI Soundness Audit Report
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## 1. Executive Summary
-- **Overall Score**: {score} / 10
-- **Main Verdict**: {"PROCEED WITH CAUTION" if score < 7 else "ROBUST"}
-- **OOS Performance (BUY)**: {oos_pips:.2f} pips
-
-## 2. Test Results
-
-### Period-wise Performance
-| Period | Side | Trade Count | Avg Net Pips | Total Pips |
-|--------|------|-------------|--------------|------------|
-"""
-        sum_period = all_trades.groupby(['period', 'side'])['net_pips'].agg(['count', 'mean', 'sum']).reset_index()
-        for _, row in sum_period.iterrows():
-            report += f"| {row['period']} | {row['side']} | {row['count']} | {row['mean']:.2f} | {row['sum']:.2f} |\n"
-
-        report += "\n### HOLD Sensitivity\n"
-        for s in sens:
-            report += f"- HOLD {s['hold']}m ({s['side']}): {s['sum_pips']:.2f} pips\n"
-
-        report += "\n### MAE Distribution (BUY)\n"
-        buy_mae = mae.loc['BUY']
-        report += f"- 95th Percentile MAE: {buy_mae['95%']:.2f} pips\n"
-        report += f"- 99th Percentile MAE: {buy_mae['99%']:.2f} pips\n"
-
-        with open(f"{OUT_DIR}/report.md", "w") as f:
-            f.write(report)
+        # summary_period_risk.csv (Extended)
+        risk_metrics = self.calculate_risk_metrics(buy_trades)
+        risk_list = []
+        for period, m in risk_metrics.items():
+            if (period, 'BUY') not in summary.index: continue
+            row = summary.loc[(period, 'BUY')].to_dict()
+            row.update(m)
+            row['period'] = period
+            row['side'] = 'BUY'
+            risk_list.append(row)
+        pd.DataFrame(risk_list).to_csv(f"{self.out_dir}/summary_period_risk.csv", index=False)
         
         # Equity Curve for OOS BUY
-        oos_buy = all_trades[(all_trades['period'] == 'OOS') & (all_trades['side'] == 'BUY')].copy()
+        oos_buy = buy_trades[buy_trades['period'] == 'OOS'].copy()
         if not oos_buy.empty:
             oos_buy['cum_pips'] = oos_buy['net_pips'].cumsum()
             plt.figure(figsize=(10,6))
             plt.plot(oos_buy['timestamp'], oos_buy['cum_pips'])
-            plt.title("OOS Equity Curve (BUY)")
+            plt.title(f"OOS Equity Curve (BUY - {exit_mode})")
             plt.grid(True)
-            plt.savefig(f"{OUT_DIR}/equity_oos_buy.png")
+            plt.savefig(f"{self.out_dir}/equity_oos.png")
+            plt.close()
+
+        return risk_list
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--exit_mode', type=str, default='baseline_hold', choices=['baseline_hold', 'mae_cut', 'energy_decay'])
+    parser.add_argument('--hold_minutes', type=int, default=240)
+    parser.add_argument('--cost_pips', type=float, default=1.0)
+    parser.add_argument('--mae_cut_pips', type=float, default=35.0)
+    parser.add_argument('--decay_ratio', type=float, default=0.5)
+    parser.add_argument('--decay_window', type=int, default=30)
+    parser.add_argument('--compare_all', action='store_true', help="Run all 3 modes and generate comparison report")
+
+    args = parser.parse_args()
+
     audit = SoundnessAudit(DATA_FILE, MODEL_BUY, MODEL_SELL)
     audit.load_and_preprocess()
-    audit.run_all_tests()
+
+    if args.compare_all:
+        print("\n=== RUNNING ALL EXIT MODES FOR COMPARISON ===")
+        
+        modes = [
+            ('baseline_hold', 'audit_results_exit_compare/exitA_baseline'),
+            ('mae_cut', 'audit_results_exit_compare/exitB_mae_cut'),
+            ('energy_decay', 'audit_results_exit_compare/exitC_energy_decay')
+        ]
+        
+        summary_compare = []
+        
+        for mode_name, out_path in modes:
+            audit.out_dir = out_path
+            if not os.path.exists(out_path): os.makedirs(out_path)
+            
+            res_list = audit.run_all_tests(exit_mode=mode_name, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio)
+            
+            if res_list:
+                # Find OOS result
+                oos_res = next((r for r in res_list if r['period'] == 'OOS'), None)
+                if oos_res:
+                    oos_res['exit_mode'] = mode_name
+                    summary_compare.append(oos_res)
+
+        # Generate Master Comparison Report
+        if summary_compare:
+            print("\nGenerating Master Comparison Report...")
+            comp_df = pd.DataFrame(summary_compare)
+            comp_df = comp_df[['exit_mode', 'count', 'sum', 'mean', 'max_dd_pips', 'mae_p95', 'mae_p99', 'pf']]
+            comp_df.to_csv("audit_results_exit_compare/comparison_oos.csv", index=False)
+            
+            report = "# Exit Layer Comparison Report (OOS Period)\n\n"
+            report += comp_df.to_markdown(index=False)
+            report += "\n\n### Evaluation Results\n"
+            
+            # Recommendation logic: MaxDD is best when closest to 0
+            best_dd_mode = comp_df.loc[comp_df['max_dd_pips'].idxmax()] 
+            report += f"\n- **Lowest Drawdown**: {best_dd_mode['exit_mode']} ({best_dd_mode['max_dd_pips']} pips)\n"
+            
+            best_mae_mode = comp_df.loc[comp_df['mae_p99'].idxmin()]
+            report += f"- **Best MAE Tail Control**: {best_mae_mode['exit_mode']} (P99: {best_mae_mode['mae_p99']} pips)\n"
+            
+            with open("audit_results_exit_compare/report.md", "w") as f:
+                f.write(report)
+            print("Comparison finished. See 'audit_results_exit_compare/report.md'")
+
+    else:
+        audit.run_all_tests(exit_mode=args.exit_mode, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio)
