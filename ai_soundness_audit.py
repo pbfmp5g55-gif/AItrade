@@ -113,30 +113,34 @@ class SoundnessAudit:
         signals = (prob_s >= rolling_thr) & atr_filter
         return signals[signals].index
 
-    def backtest(self, entry_timestamps, side, exit_mode='baseline_hold', 
-                 hold_m=240, cost_pips=1.0, sl_atr_mult=3.0, 
-                 mae_cut_pips=35, decay_window=30, decay_ratio=0.5):
+    def backtest(self, entry_timestamps, side, exit_mode='baseline_hold', hold_m=240, cost_pips=1.0, sl_atr_mult=3.0, mae_cut_pips=35, decay_window=30, decay_ratio=0.5, t_noise=30, t_judge_end=90, risk_hours=[19,20], mae_cut_risk=25):
         results = []
+        sl_pips = 100 # Default SL 100 pips
         
-        for t in entry_timestamps:
-            # 3.1 Next-bar entry
+        for t in tqdm(entry_timestamps, desc=f"Backtesting {side}"):
+            if t not in self.ohlc.index: continue
+            
+            # Entry at next bar open
             entry_idx = self.ohlc.index.get_loc(t) + 1
             if entry_idx >= len(self.ohlc): continue
             
             entry_time = self.ohlc.index[entry_idx]
+            entry_row = self.ohlc.iloc[entry_idx]
             
-            # Entry Price: BUY at Ask (ohlc['open']), SELL at Bid (bid_ohlc['open'])
-            entry_price = self.ohlc.iloc[entry_idx]['open'] if side == 'BUY' else self.bid_ohlc.iloc[entry_idx]['open']
-            
-            # SL calculation (ATR-based)
-            atr_h1_val = self.ohlc.iloc[entry_idx-1]['ATR_1H']
-            sl_dist = atr_h1_val * sl_atr_mult
-            sl_price = entry_price - sl_dist if side == 'BUY' else entry_price + sl_dist
-            
-            # Energy Decay Initial Stats (C1/C2)
-            entry_atr_1m = self.ohlc.iloc[entry_idx]['ATR_1m']
-            entry_body_avg = self.ohlc.iloc[entry_idx-5:entry_idx+1]['Body_Size'].mean() # 5-min average at entry
+            # Use strict Ask/Bid if possible
+            if side == 'BUY':
+                # Entry at Ask Open (using ask-based OHLC already provided in load_and_preprocess)
+                entry_price = entry_row['open']
+                sl_price = entry_price - (sl_pips / 100)
+            else:
+                # Entry at Bid Open (bid_ohlc)
+                entry_price = self.bid_ohlc.iloc[entry_idx]['open']
+                sl_price = entry_price + (sl_pips / 100)
 
+            # Features at entry time for Energy Decay
+            entry_body_avg = self.ohlc.loc[t, 'Body_Size']
+            entry_atr_1m = self.ohlc.loc[t, 'ATR_1m']
+            
             # Simulation Window
             end_idx = min(entry_idx + hold_m, len(self.ohlc) - 1)
             window_ohlc = self.ohlc.iloc[entry_idx : end_idx + 1]
@@ -178,11 +182,12 @@ class SoundnessAudit:
                         break
 
                 # --- Exit Mode Logic ---
+                mae_pips = mae * 100
+                is_risk_hour = curr_time.hour in risk_hours
                 
                 # Exit B: MAE Monitoring Cut (at 30m)
                 if exit_mode == 'mae_cut' and i == 30:
-                    current_mae_pips = mae * 100
-                    if current_mae_pips >= mae_cut_pips:
+                    if mae_pips >= mae_cut_pips:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
                         exit_time = curr_time
                         exit_reason = "MAE_CUT"
@@ -191,24 +196,43 @@ class SoundnessAudit:
                 # Exit C: Energy Decay (starting at 20m)
                 if exit_mode == 'energy_decay' and i >= 20:
                     # Lookback Window
-                    start_look = max(0, i - decay_window)
+                    start_look = max(0, i - 14) # Changed from decay_window to 14 for consistency with new logic
                     window_segment = window_ohlc.iloc[start_look : i + 1]
                     
                     # C1: Body Decay
-                    current_body_avg = window_segment['Body_Size'].mean()
-                    if current_body_avg < entry_body_avg * decay_ratio:
-                        exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
-                        exit_time = curr_time
-                        exit_reason = "DECAY_BODY"
-                        break
-                        
                     # C2: Volatility Decay
-                    current_atr_avg = window_segment['ATR_1m'].mean()
-                    if current_atr_avg < entry_atr_1m * decay_ratio:
+                    if window_segment['Body_Size'].mean() < entry_body_avg * decay_ratio or window_segment['ATR_1m'].mean() < entry_atr_1m * decay_ratio:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
                         exit_time = curr_time
-                        exit_reason = "DECAY_VOL"
+                        exit_reason = "DECAY"
                         break
+
+                # --- Exit D: Unified 3-Phase Exit ---
+                if exit_mode == 'unified_3phase':
+                    # Phase 1: Noise (at T_noise)
+                    if i == t_noise:
+                        current_mae_limit = mae_cut_risk if is_risk_hour else mae_cut_pips
+                        if mae_pips >= current_mae_limit:
+                            exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                            exit_time = curr_time
+                            exit_reason = "U3P_P1_MAE" + ("_RISK" if is_risk_hour else "")
+                            break
+                    
+                    # Phase 2: Decision (T_noise to T_judge_end)
+                    if i > t_noise and i <= t_judge_end:
+                        start_look = max(0, i - 14) # 14-min lookback for decay
+                        window_segment = window_ohlc.iloc[start_look : i + 1]
+                        
+                        current_decay_ratio = decay_ratio + 0.1 if is_risk_hour else decay_ratio # Stricter in risk hours
+                        
+                        if window_segment['Body_Size'].mean() < entry_body_avg * current_decay_ratio or window_segment['ATR_1m'].mean() < entry_atr_1m * current_decay_ratio:
+                            exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                            exit_time = curr_time
+                            exit_reason = "U3P_P2_DECAY" + ("_RISK" if is_risk_hour else "")
+                            break
+                    
+                    # Phase 3: Recovery (After T_judge_end)
+                    # No Decay logic here, just wait for HOLD or SL
             
             if exit_price is None:
                 # Time-based exit
@@ -216,13 +240,14 @@ class SoundnessAudit:
                 final_bid = window_bid.iloc[-1]
                 exit_price = final_bid['close'] if side == 'BUY' else final_ohlc['close']
                 exit_time = window_ohlc.index[-1]
+                exit_reason = "U3P_P3_HOLD" if exit_mode == 'unified_3phase' else "HOLD"
             
             pips = (exit_price - entry_price) * 100 if side == 'BUY' else (entry_price - exit_price) * 100
             net_pips = pips - cost_pips
             
-            # SMA Trend for Regime Analysis
-            sma_trend = "UP" if self.ohlc.loc[t, 'SMA120_Slope'] > 0 else "DOWN"
-            vol_regime = "HIGH" if self.ohlc.loc[t, 'ATR_1H'] > self.ohlc['ATR_1H'].median() else "LOW"
+            # SMA Trend for Regime Analysis (removed from results, but kept for potential future use)
+            # sma_trend = "UP" if self.ohlc.loc[t, 'SMA120_Slope'] > 0 else "DOWN"
+            # vol_regime = "HIGH" if self.ohlc.loc[t, 'ATR_1H'] > self.ohlc['ATR_1H'].median() else "LOW"
             
             results.append({
                 'signal_time': t,
@@ -235,9 +260,10 @@ class SoundnessAudit:
                 'mae': mae * 100,
                 'mfe': mfe * 100,
                 'reason': exit_reason,
-                'sma_trend': sma_trend,
-                'vol_regime': vol_regime,
+                # 'sma_trend': sma_trend, # Removed
+                # 'vol_regime': vol_regime, # Removed
                 'hour_utc': t.hour,
+                'is_risk_hour': t.hour in risk_hours,
                 'hold_min_actual': i
             })
             
@@ -361,12 +387,12 @@ class SoundnessAudit:
             }
         return metrics
 
-    def run_all_tests(self, exit_mode='baseline_hold', hold_m=240, cost_pips=1.0, mae_cut_pips=35, decay_ratio=0.5):
+    def run_all_tests(self, exit_mode='baseline_hold', hold_m=240, cost_pips=1.0, mae_cut_pips=35, decay_ratio=0.5, t_noise=30, t_judge_end=90, risk_hours=[19,20], mae_cut_risk=25):
         # 1. Prediction for both sides
         buy_signals = self.run_inference('BUY')
         
         print(f"--- Running Audit: Mode={exit_mode}, Cost={cost_pips} ---")
-        buy_trades = self.backtest(buy_signals, 'BUY', exit_mode=exit_mode, hold_m=hold_m, cost_pips=cost_pips, mae_cut_pips=mae_cut_pips, decay_ratio=decay_ratio)
+        buy_trades = self.backtest(buy_signals, 'BUY', exit_mode=exit_mode, hold_m=hold_m, cost_pips=cost_pips, mae_cut_pips=mae_cut_pips, decay_ratio=decay_ratio, t_noise=t_noise, t_judge_end=t_judge_end, risk_hours=risk_hours, mae_cut_risk=mae_cut_risk)
         
         if buy_trades.empty:
             print("No trades generated.")
@@ -415,12 +441,16 @@ class SoundnessAudit:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--exit_mode', type=str, default='baseline_hold', choices=['baseline_hold', 'mae_cut', 'energy_decay'])
+    parser.add_argument('--exit_mode', type=str, default='baseline_hold', choices=['baseline_hold', 'mae_cut', 'energy_decay', 'unified_3phase'])
     parser.add_argument('--hold_minutes', type=int, default=240)
     parser.add_argument('--cost_pips', type=float, default=1.0)
     parser.add_argument('--mae_cut_pips', type=float, default=35.0)
+    parser.add_argument('--mae_cut_pips_risk', type=float, default=25.0)
     parser.add_argument('--decay_ratio', type=float, default=0.5)
-    parser.add_argument('--decay_window', type=int, default=30)
+    parser.add_argument('--decay_window', type=int, default=30) # Kept for backward compatibility, though not used in new decay logic
+    parser.add_argument('--t_noise', type=int, default=30)
+    parser.add_argument('--t_judge_end', type=int, default=90)
+    parser.add_argument('--risk_hours', type=int, nargs='+', default=[19, 20])
     parser.add_argument('--compare_all', action='store_true', help="Run all 3 modes and generate comparison report")
 
     args = parser.parse_args()
@@ -433,8 +463,8 @@ if __name__ == "__main__":
         
         modes = [
             ('baseline_hold', 'audit_results_exit_compare/exitA_baseline'),
-            ('mae_cut', 'audit_results_exit_compare/exitB_mae_cut'),
-            ('energy_decay', 'audit_results_exit_compare/exitC_energy_decay')
+            ('energy_decay', 'audit_results_exit_compare/exitB_energy_decay'),
+            ('unified_3phase', 'audit_results_exit_compare/exitC_unified_3phase')
         ]
         
         summary_compare = []
@@ -443,7 +473,7 @@ if __name__ == "__main__":
             audit.out_dir = out_path
             if not os.path.exists(out_path): os.makedirs(out_path)
             
-            res_list = audit.run_all_tests(exit_mode=mode_name, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio)
+            res_list = audit.run_all_tests(exit_mode=mode_name, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio, t_noise=args.t_noise, t_judge_end=args.t_judge_end, risk_hours=args.risk_hours, mae_cut_risk=args.mae_cut_pips_risk)
             
             if res_list:
                 # Find OOS result
@@ -475,4 +505,4 @@ if __name__ == "__main__":
             print("Comparison finished. See 'audit_results_exit_compare/report.md'")
 
     else:
-        audit.run_all_tests(exit_mode=args.exit_mode, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio)
+        audit.run_all_tests(exit_mode=args.exit_mode, hold_m=args.hold_minutes, cost_pips=args.cost_pips, mae_cut_pips=args.mae_cut_pips, decay_ratio=args.decay_ratio, t_noise=args.t_noise, t_judge_end=args.t_judge_end, risk_hours=args.risk_hours, mae_cut_risk=args.mae_cut_pips_risk)

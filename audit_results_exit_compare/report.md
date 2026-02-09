@@ -1,12 +1,12 @@
 # Exit Layer Comparison Report (OOS Period)
 
-| exit_mode     |   count |     sum |   mean |   max_dd_pips |   mae_p95 |   mae_p99 |   pf |
-|:--------------|--------:|--------:|-------:|--------------:|----------:|----------:|-----:|
-| baseline_hold |     405 | 1712.35 |   4.23 |      -4546.62 |     53.08 |     56.39 | 1.29 |
-| mae_cut       |     405 | 1144.71 |   2.83 |      -4336.59 |     51.88 |     55.09 | 1.2  |
-| energy_decay  |     405 |  267.72 |   0.66 |      -2558.18 |     51.68 |     55.09 | 1.06 |
+| exit_mode      |   count |    sum |   mean |   max_dd_pips |   mae_p95 |   mae_p99 |   pf |
+|:---------------|--------:|-------:|-------:|--------------:|----------:|----------:|-----:|
+| baseline_hold  |     405 | 1001   |   2.47 |       -5257.6 |     69.22 |     98.26 | 1.15 |
+| energy_decay   |     405 | -501.4 |  -1.24 |       -2934.5 |     61.04 |     82.59 | 0.89 |
+| unified_3phase |     405 |  151.6 |   0.37 |       -2929.4 |     51.88 |     80.5  | 1.03 |
 
 ### Evaluation Results
 
-- **Lowest Drawdown**: energy_decay (-2558.18 pips)
-- **Best MAE Tail Control**: mae_cut (P99: 55.09 pips)
+- **Lowest Drawdown**: unified_3phase (-2929.4 pips)
+- **Best MAE Tail Control**: unified_3phase (P99: 80.5 pips)
