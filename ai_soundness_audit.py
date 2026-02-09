@@ -143,6 +143,7 @@ class SoundnessAudit:
             window_bid = self.bid_ohlc.iloc[entry_idx : end_idx + 1]
             
             exit_price = None
+            exit_time = None
             exit_reason = "HOLD"
             mae = 0
             mfe = 0
@@ -150,6 +151,7 @@ class SoundnessAudit:
             for i in range(len(window_ohlc)):
                 curr_ohlc = window_ohlc.iloc[i]
                 curr_bid = window_bid.iloc[i]
+                curr_time = window_ohlc.index[i]
                 
                 # Update MAE/MFE
                 if side == 'BUY':
@@ -160,6 +162,7 @@ class SoundnessAudit:
                     
                     if low_p <= sl_price:
                         exit_price = sl_price
+                        exit_time = curr_time
                         exit_reason = "SL"
                         break
                 else:
@@ -170,6 +173,7 @@ class SoundnessAudit:
                     
                     if high_p >= sl_price:
                         exit_price = sl_price
+                        exit_time = curr_time
                         exit_reason = "SL"
                         break
 
@@ -180,6 +184,7 @@ class SoundnessAudit:
                     current_mae_pips = mae * 100
                     if current_mae_pips >= mae_cut_pips:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                        exit_time = curr_time
                         exit_reason = "MAE_CUT"
                         break
 
@@ -193,6 +198,7 @@ class SoundnessAudit:
                     current_body_avg = window_segment['Body_Size'].mean()
                     if current_body_avg < entry_body_avg * decay_ratio:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                        exit_time = curr_time
                         exit_reason = "DECAY_BODY"
                         break
                         
@@ -200,6 +206,7 @@ class SoundnessAudit:
                     current_atr_avg = window_segment['ATR_1m'].mean()
                     if current_atr_avg < entry_atr_1m * decay_ratio:
                         exit_price = curr_bid['close'] if side == 'BUY' else curr_ohlc['close']
+                        exit_time = curr_time
                         exit_reason = "DECAY_VOL"
                         break
             
@@ -208,6 +215,7 @@ class SoundnessAudit:
                 final_ohlc = window_ohlc.iloc[-1]
                 final_bid = window_bid.iloc[-1]
                 exit_price = final_bid['close'] if side == 'BUY' else final_ohlc['close']
+                exit_time = window_ohlc.index[-1]
             
             pips = (exit_price - entry_price) * 100 if side == 'BUY' else (entry_price - exit_price) * 100
             net_pips = pips - cost_pips
@@ -217,7 +225,9 @@ class SoundnessAudit:
             vol_regime = "HIGH" if self.ohlc.loc[t, 'ATR_1H'] > self.ohlc['ATR_1H'].median() else "LOW"
             
             results.append({
-                'timestamp': t,
+                'signal_time': t,
+                'entry_time': entry_time,
+                'exit_time': exit_time,
                 'side': side,
                 'entry_p': entry_price,
                 'exit_p': exit_price,
@@ -233,6 +243,93 @@ class SoundnessAudit:
             
         return pd.DataFrame(results)
 
+    def extract_dd_decomposition(self, trades_df):
+        if trades_df.empty:
+            return
+            
+        # 1. Build Realized Equity Curve
+        equity_df = trades_df.sort_values('exit_time').copy()
+        equity_df['cum_pips'] = equity_df['net_pips'].cumsum()
+        equity_df['running_max'] = equity_df['cum_pips'].cummax()
+        equity_df['drawdown'] = equity_df['cum_pips'] - equity_df['running_max']
+        equity_df.to_csv(f"{self.out_dir}/equity_oos_trades.csv", index=False)
+        
+        # 2. Extract DD Events
+        dd_events = []
+        event_id = 0
+        in_dd = False
+        peak_time = equity_df.iloc[0]['exit_time']
+        peak_val = equity_df.iloc[0]['cum_pips']
+        
+        for idx, row in equity_df.iterrows():
+            if row['cum_pips'] >= peak_val:
+                if in_dd:
+                    # DD Event Recovered
+                    event['recovered'] = True
+                    event['recovery_time'] = row['exit_time']
+                    dd_events.append(event)
+                    in_dd = False
+                peak_time = row['exit_time']
+                peak_val = row['cum_pips']
+            else:
+                if not in_dd:
+                    # New DD Event Starts
+                    in_dd = True
+                    event_id += 1
+                    event = {
+                        'event_id': event_id,
+                        'peak_time': peak_time,
+                        'peak_equity': round(peak_val, 2),
+                        'trough_time': row['exit_time'],
+                        'trough_equity': round(row['cum_pips'], 2),
+                        'max_dd_pips': round(row['drawdown'], 2),
+                        'recovered': False,
+                        'recovery_time': None
+                    }
+                else:
+                    # Update Trough
+                    if row['cum_pips'] < event['trough_equity']:
+                        event['trough_time'] = row['exit_time']
+                        event['trough_equity'] = round(row['cum_pips'], 2)
+                        event['max_dd_pips'] = round(row['drawdown'], 2)
+        
+        if in_dd:
+            dd_events.append(event)
+            
+        df_events = pd.DataFrame(dd_events)
+        if not df_events.empty:
+            df_events['duration_to_trough_min'] = (df_events['trough_time'] - df_events['peak_time']).dt.total_seconds() / 60
+            df_events.to_csv(f"{self.out_dir}/dd_events_oos.csv", index=False)
+            
+            # 3. Culprit Ranking (Top 10)
+            culprits_list = []
+            for _, ev in df_events.iterrows():
+                # Trades that CLOSED during the [peak, trough] period
+                culprits = equity_df[(equity_df['exit_time'] >= ev['peak_time']) & (equity_df['exit_time'] <= ev['trough_time'])].copy()
+                if culprits.empty: continue
+                
+                culprits['dd_contribution_pips'] = culprits['net_pips'].clip(upper=0)
+                culprits = culprits.sort_values('dd_contribution_pips').head(10)
+                culprits['event_id'] = ev['event_id']
+                culprits_list.append(culprits)
+            
+            if culprits_list:
+                df_culprits = pd.concat(culprits_list)
+                df_culprits.to_csv(f"{self.out_dir}/dd_culprits_oos_top10.csv", index=False)
+                
+                # 4. Culprit Summary
+                summary_list = []
+                for eid, group in df_culprits.groupby('event_id'):
+                    summary_list.append({
+                        'event_id': eid,
+                        'culprit_count': len(group),
+                        'avg_mae': group['mae'].mean().round(2),
+                        'avg_hold': group['hold_min_actual'].mean().round(2),
+                        'reasons': group['reason'].value_counts().to_dict(),
+                        'hours': group['hour_utc'].value_counts().to_dict()
+                    })
+                pd.DataFrame(summary_list).to_csv(f"{self.out_dir}/dd_culprits_summary_oos.csv", index=False)
+
     def calculate_risk_metrics(self, trades_df):
         if trades_df.empty:
             return {}
@@ -247,8 +344,10 @@ class SoundnessAudit:
             pf = pos / neg if neg != 0 else np.inf
             win_rate = (p_df['net_pips'] > 0).mean() * 100
             
-            # Max DD
-            cum_pips = p_df['net_pips'].cumsum()
+            # Max DD (Realized)
+            # Need to sort by exit_time for correct DD calculation
+            e_df = p_df.sort_values('exit_time')
+            cum_pips = e_df['net_pips'].cumsum()
             running_max = cum_pips.cummax()
             dd = cum_pips - running_max
             max_dd = dd.min()
@@ -275,9 +374,13 @@ class SoundnessAudit:
 
         # Period Split
         buy_trades['period'] = 'OOS'
-        buy_trades.loc[buy_trades['timestamp'] <= pd.Timestamp(TRAIN_END), 'period'] = 'TRAIN'
-        buy_trades.loc[(buy_trades['timestamp'] > pd.Timestamp(TRAIN_END)) & (buy_trades['timestamp'] <= pd.Timestamp(VAL_END)), 'period'] = 'VAL'
+        buy_trades.loc[buy_trades['signal_time'] <= pd.Timestamp(TRAIN_END), 'period'] = 'TRAIN'
+        buy_trades.loc[(buy_trades['signal_time'] > pd.Timestamp(TRAIN_END)) & (buy_trades['signal_time'] <= pd.Timestamp(VAL_END)), 'period'] = 'VAL'
         
+        # DD Decomposition for OOS
+        oos_trades = buy_trades[buy_trades['period'] == 'OOS'].copy()
+        self.extract_dd_decomposition(oos_trades)
+
         # Save Details
         buy_trades.to_csv(f"{self.out_dir}/trades.csv", index=False)
         
@@ -298,11 +401,11 @@ class SoundnessAudit:
         pd.DataFrame(risk_list).to_csv(f"{self.out_dir}/summary_period_risk.csv", index=False)
         
         # Equity Curve for OOS BUY
-        oos_buy = buy_trades[buy_trades['period'] == 'OOS'].copy()
-        if not oos_buy.empty:
-            oos_buy['cum_pips'] = oos_buy['net_pips'].cumsum()
+        if not oos_trades.empty:
+            oos_trades = oos_trades.sort_values('exit_time')
+            oos_trades['cum_pips'] = oos_trades['net_pips'].cumsum()
             plt.figure(figsize=(10,6))
-            plt.plot(oos_buy['timestamp'], oos_buy['cum_pips'])
+            plt.plot(oos_trades['exit_time'], oos_trades['cum_pips'])
             plt.title(f"OOS Equity Curve (BUY - {exit_mode})")
             plt.grid(True)
             plt.savefig(f"{self.out_dir}/equity_oos.png")
