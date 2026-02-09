@@ -1,0 +1,8 @@
+pandas
+scikit-learn
+joblib
+skl2onnx
+onnxruntime
+pandas_ta
+pyarrow
+fastparquet

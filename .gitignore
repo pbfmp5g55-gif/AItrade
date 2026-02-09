@@ -1,0 +1,24 @@
+# Data Files
+*.parquet
+*.csv
+!audit_results*/*.csv
+!oos_detailed_signals_sagemaker.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Models (Keep ONNX models, but ignore backups if huge)
+*.old
+# *.onnx  # Keep these if they are relatively small (~1MB)
+
+# System
+.DS_Store
+Thumbs.db
+
+# Gemini / Antigravity
+.gemini/
+brain/
